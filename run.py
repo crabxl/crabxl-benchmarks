@@ -1,11 +1,24 @@
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "crabxl",
+#     "wolfxl",
+#     "oxlsx",
+#     "python-calamine",
+#     "fastexcel",
+#     "pyarrow",
+#     "xlsxwriter",
+#     "openpyxl==3.1.5",
+# ]
+# ///
 """Run the CrabXL for Python benchmark suite against other Python XLSX libraries.
 
 Each case runs in its own Python process. The parent measures wall time and
-the peak resident memory of that process. Results go to python/results/:
+the peak resident memory of that process. Results go to results/:
 results.json, results.md and one SVG chart per scenario and size.
 
-    python python/run.py
-    python python/run.py --sizes small --runs 1
+    uv run run.py
+    uv run run.py --sizes small --runs 1
 
 openpyxl is slow, so it runs on the small size only.
 """
@@ -24,19 +37,18 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 RESULTS = ROOT / "results"
-# Size name: (rows, columns). The xl and xxl files (about 370 MB and 1 GB) are
-# read only. They come from the Rust suite (see --fixtures): XlsxWriter can only
-# write files that large in constant-memory mode, which stores text inline.
+# Size name: (rows, columns). The xl, xxl and nyc311 files are read only.
 SIZES = {
     "small": (10_000, 10),
     "medium": (100_000, 10),
     "large": (1_000_000, 10),
     "xl": (1_000_000, 100),
     "xxl": (1_000_000, 280),
-    # The NYC 311 sample that the calamine README uses (see the Rust suite).
+    # The NYC 311 sample that the calamine README uses. See the README.
     "nyc311": (1_000_001, 41),
 }
-# Readers of the xl and xxl files. At xxl, readers that build Python objects for
+NYC311_CELLS = 28_056_975  # Non-empty fields of the CSV.
+# Readers of the read-only sizes. At xxl, readers that build Python objects for
 # the whole sheet would need more than 28 GB, so only streaming readers run.
 STREAMING_READERS = [
     "crabxl (read_only)",
@@ -49,14 +61,13 @@ HUGE_READERS = {
     "xxl": STREAMING_READERS,
     "nyc311": STREAMING_READERS + ["crabxl", "python-calamine"],
 }
-HUGE = set(HUGE_READERS)
 PINNED_CPU = 2  # Not CPU 0, which handles most interrupts.
 COLUMNS = 10
 SHEET = "Data"
 EDIT_STEP = 100
 EDIT_APPEND = 100
-TIMEOUT = 300
-SLOW_CASE = 10  # seconds; slower cases get one measured run
+TIMEOUT = 120
+SLOW_CASE = 10  # seconds; slower cases are measured once
 SMALL_ONLY = ("openpyxl",)
 
 SCENARIOS = {
@@ -88,7 +99,7 @@ SCENARIOS = {
 
 
 def value(row, column):
-    """The generated cell values. The Rust suite in crabxl uses the same data."""
+    """The generated cell values."""
     if column == 0:
         return row
     if column == 1:
@@ -109,9 +120,9 @@ def value(row, column):
     return value(row, column % 10)  # Wider sheets repeat the 10-column pattern.
 
 
-def rows(start, stop):
+def rows(start, stop, columns=COLUMNS):
     for row in range(start, stop):
-        yield [value(row, column) for column in range(COLUMNS)]
+        yield [value(row, column) for column in range(columns)]
 
 
 # ---------------------------------------------------------------- cases
@@ -240,12 +251,19 @@ def edit(library, source, path, count):
     return changed
 
 
-def fixture(count, path):
+def fixture(count, columns, path):
+    """Write an input file with XlsxWriter.
+
+    Files wider than 10 columns use constant-memory mode, the only mode in which
+    XlsxWriter can write them. That mode stores text inline instead of in a
+    shared string table. Writing xxl takes a long time, but only once.
+    """
     import xlsxwriter
 
-    with xlsxwriter.Workbook(str(path), {"default_date_format": "yyyy-mm-dd"}) as book:
+    options = {"default_date_format": "yyyy-mm-dd", "constant_memory": columns > 10}
+    with xlsxwriter.Workbook(str(path), options) as book:
         sheet = book.add_worksheet(SHEET)
-        for index, row in enumerate(rows(0, count)):
+        for index, row in enumerate(rows(0, count, columns)):
             sheet.write_row(index, 0, row)
 
 
@@ -332,23 +350,22 @@ def cpu_time(process):
     return (times[2].value + times[3].value) / 1e7
 
 
-def run(command, cpus, env=None):
-    """Run one case on one pinned CPU or on all CPUs.
+def run(command, env=None):
+    """Run one case pinned to one CPU, so that every library runs single-threaded.
 
-    Return (seconds, peak bytes, CPU seconds, stdout), or None on a timeout. A
-    pinned child starts suspended and gets its CPU before it runs any code, so
-    it cannot size thread pools for more CPUs.
+    Return (seconds, peak bytes, CPU seconds, stdout), or None on a timeout. The
+    child starts suspended and gets its CPU before it runs any code, so it
+    cannot size thread pools for more CPUs.
     """
-    pinned = cpus == "1"
     options = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "env": env}
-    if pinned and os.name == "nt":
+    if os.name == "nt":
         options["creationflags"] = 0x4  # CREATE_SUSPENDED
-    elif pinned and hasattr(os, "sched_setaffinity"):
+    elif hasattr(os, "sched_setaffinity"):
         options["preexec_fn"] = lambda: os.sched_setaffinity(0, {PINNED_CPU})
-    elif pinned:
+    else:
         raise SystemExit("This platform cannot pin a process to one CPU.")
     process = subprocess.Popen(command, **options)
-    if pinned and os.name == "nt":
+    if os.name == "nt":
         handle = ctypes.c_void_p(int(process._handle))
         mask = ctypes.c_size_t(1 << PINNED_CPU)
         if not ctypes.windll.kernel32.SetProcessAffinityMask(handle, mask):
@@ -405,19 +422,6 @@ def main():
         help="rewrite results.md from results.json",
     )
     parser.add_argument("--libraries", nargs="+", help="run only these libraries")
-    parser.add_argument(
-        "--cpus",
-        nargs="+",
-        choices=["all", "1"],
-        default=["all", "1"],
-        help="run each case on all CPUs, on one pinned CPU, or both",
-    )
-    parser.add_argument(
-        "--fixtures",
-        type=Path,
-        default=ROOT.parent / "rust" / "data",
-        help="folder with the xl, xxl and nyc311 files of the Rust suite",
-    )
     args = parser.parse_args()
     if args.report_only:
         report = json.loads((RESULTS / "results.json").read_text())
@@ -431,19 +435,15 @@ def main():
     work = ROOT / "data"
     work.mkdir(exist_ok=True)
     results = []
-    for cpus, size in [(c, s) for c in args.cpus for s in args.sizes]:
+    for size in args.sizes:
         count, columns = SIZES[size]
         source = work / f"{size}.xlsx"
-        if size in HUGE:
-            source = (args.fixtures or work) / f"{size}.xlsx"
-            if not source.exists():
-                raise SystemExit(
-                    f"{source} is missing. Run python rust/run.py --sizes {size}"
-                    " first, or pass --fixtures with the folder that has it."
-                )
-        elif not source.exists():
-            fixture(count, source)
-        scenarios = {"read": HUGE_READERS[size]} if size in HUGE else SCENARIOS
+        if size == "nyc311" and not source.exists():
+            raise SystemExit(f"{source} is missing. See the README to build it.")
+        if not source.exists():
+            print(f"Writing {source.name}", flush=True)
+            fixture(count, columns, source)
+        scenarios = {"read": HUGE_READERS[size]} if size in HUGE_READERS else SCENARIOS
         for scenario, libraries in scenarios.items():
             for library in libraries:
                 if size != "small" and library.startswith(SMALL_ONLY):
@@ -472,21 +472,20 @@ def main():
                     "file_mib": source.stat().st_size / 2**20,
                     "scenario": scenario,
                     "library": library,
-                    "cpus": cpus,
                 }
                 if size == "nyc311":
                     # The CSV has empty fields; readers count non-empty cells.
-                    counted = source.with_name("nyc311.cells").read_text()
-                    record["expected_cells"] = int(counted)
-                if slow(previous, (cpus, scenario), library):
+                    record["expected_cells"] = NYC311_CELLS
+                if slow(previous, scenario, library):
                     record["timeout"] = TIMEOUT
                     record["estimated"] = True
                 # One extra first run warms the file cache; it is not counted. A
-                # case slower than SLOW_CASE seconds gets one measured run.
+                # case slower than SLOW_CASE seconds keeps that first run as its
+                # only measurement, which keeps the whole suite short.
                 wanted, attempt = args.runs, 0
                 while "timeout" not in record and attempt <= wanted:
                     try:
-                        result = run(command, cpus, env)
+                        result = run(command, env)
                     except RuntimeError as error:
                         record["error"] = str(error).strip().splitlines()[-1]
                         break
@@ -497,6 +496,8 @@ def main():
                         measured.append(result)
                     elif result[0] > SLOW_CASE:
                         wanted = 1
+                        measured.append(result)
+                        break
                     attempt += 1
                 if measured and len(measured) == wanted:
                     record["runs"] = wanted
@@ -507,7 +508,7 @@ def main():
                     record["cpu_seconds"] = statistics.median(m[2] for m in measured)
                     record["cells"] = int(measured[0][3])
                 results.append(check(record))
-                previous[((cpus, scenario), library)] = record
+                previous[(scenario, library)] = record
                 print(json.dumps(record), flush=True)
                 output.unlink(missing_ok=True)
 
@@ -520,35 +521,33 @@ def main():
         "results": results,
     }
     RESULTS.mkdir(exist_ok=True)
-    # Keep earlier results for the sizes and CPU modes that this run did not measure.
+    # Keep earlier results for the sizes that this run did not measure.
     saved = RESULTS / "results.json"
     if saved.exists():
-        done = {(size, cpus) for size in args.sizes for cpus in args.cpus}
         kept = [
             r
             for r in json.loads(saved.read_text())["results"]
-            if (r["size"], r.get("cpus", "all")) not in done
+            if r["size"] not in args.sizes and r["size"] in SIZES
         ]
         order = list(SIZES)
-        report["results"] = sorted(
-            kept + results,
-            key=lambda r: (r.get("cpus", "all") == "1", order.index(r["size"])),
-        )
+        report["results"] = sorted(kept + results, key=lambda r: order.index(r["size"]))
     saved.write_text(json.dumps(report, indent=1) + "\n")
     write_report(report, "Python")
 
 
 # ---------------------------------------------------------------- report
-# Copied from rust/run.py, so that both suites look the same.
 
 
 def write_report(report, title):
     lines = [
         f"# {title} benchmark results",
         "",
-        f"Machine: {report['machine']}, {report['cpus']} logical CPUs. "
-        f"Median of {report['runs']} runs. Time is the wall time of the whole "
-        "process. Memory is the peak resident memory of the process.",
+        (
+            f"Machine: {report['machine']}. Every library is pinned to the same "
+            f"single logical CPU. Median of {report['runs']} runs. Time is the wall "
+            "time of the whole process. Memory is the peak resident memory of the "
+            "process."
+        ),
         "",
     ]
     if "versions" in report:
@@ -560,55 +559,41 @@ def write_report(report, title):
         ]
     groups = {}
     for record in report["results"]:
-        key = (record.get("cpus", "all"), record["scenario"], record["size"])
-        groups.setdefault(key, []).append(record)
-    for cpus in ("all", "1"):
-        if not any(key[0] == cpus for key in groups):
-            continue
+        groups.setdefault((record["scenario"], record["size"]), []).append(record)
+    for (scenario, size), records in groups.items():
+        first = records[0]
+        shape = f"{first['rows']:,} rows × {first.get('columns', 10)} columns"
+        if scenario != "write" and "file_mib" in first:
+            shape += f", {first['file_mib']:,.0f} MiB file"
+        name = f"{scenario}-{size}"
         lines += [
-            "# All CPUs" if cpus == "all" else "# One CPU",
+            f"## {scenario.capitalize()}, {size} ({shape})",
             "",
-            "Every library can use all logical CPUs."
-            if cpus == "all"
-            else "Every library is pinned to the same single logical CPU.",
+            f"![{scenario} {size}]({name}.svg)",
             "",
+            "| Library | Time (s) | CPU time (s) | Peak memory (MiB) |",
+            "|---|---:|---:|---:|",
         ]
-        for (mode, scenario, size), records in groups.items():
-            if mode != cpus:
-                continue
-            first = records[0]
-            shape = f"{first['rows']:,} rows × {first.get('columns', 10)} columns"
-            if scenario != "write" and "file_mib" in first:
-                shape += f", {first['file_mib']:,.0f} MiB file"
-            name = f"{scenario}-{size}" + ("" if cpus == "all" else "-1cpu")
-            lines += [
-                f"## {scenario.capitalize()}, {size} ({shape})",
-                "",
-                f"![{scenario} {size}]({name}.svg)",
-                "",
-                "| Library | Time (s) | CPU time (s) | Peak memory (MiB) |",
-                "|---|---:|---:|---:|",
-            ]
-            for record in records:
-                library = record["library"]
-                if "timeout" in record:
-                    note = (
-                        " (estimated from the smaller size)"
-                        if record.get("estimated")
-                        else ""
-                    )
-                    lines.append(f"| {library} | > {record['timeout']}{note} | – | – |")
-                elif "error" in record:
-                    lines.append(f"| {library} | failed: {record['error']} | – | – |")
-                else:
-                    used = record.get("cpu_seconds")
-                    used = "–" if used is None else f"{used:.3f}"
-                    lines.append(
-                        f"| {library} | {record['seconds']:.3f} | {used} "
-                        f"| {record['peak_mib']:.1f} |"
-                    )
-            lines.append("")
-            (RESULTS / f"{name}.svg").write_text(chart(records))
+        for record in records:
+            library = record["library"]
+            if "timeout" in record:
+                note = (
+                    " (estimated from the smaller size)"
+                    if record.get("estimated")
+                    else ""
+                )
+                lines.append(f"| {library} | > {record['timeout']}{note} | – | – |")
+            elif "error" in record:
+                lines.append(f"| {library} | failed: {record['error']} | – | – |")
+            else:
+                used = record.get("cpu_seconds")
+                used = "–" if used is None else f"{used:.3f}"
+                lines.append(
+                    f"| {library} | {record['seconds']:.3f} | {used} "
+                    f"| {record['peak_mib']:.1f} |"
+                )
+        lines.append("")
+        (RESULTS / f"{name}.svg").write_text(chart(records))
     (RESULTS / "results.md").write_text("\n".join(lines))
 
 
@@ -619,10 +604,14 @@ def chart(records):
     height = 40 + len(records) * (bar + gap)
     width = label_width + 2 * panel + 60
     parts = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
-        f'viewBox="0 0 {width} {height}" font-family="system-ui, sans-serif" font-size="13">',
-        "<style>text{fill:#334}.t{font-weight:600}.crabxl{fill:#e8590c}.other{fill:#8a94a6}"
-        "@media (prefers-color-scheme: dark){text{fill:#dde}.other{fill:#6b7385}}</style>",
+        (
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+            f'viewBox="0 0 {width} {height}" font-family="system-ui, sans-serif" font-size="13">'
+        ),
+        (
+            "<style>text{fill:#334}.t{font-weight:600}.crabxl{fill:#e8590c}.other{fill:#8a94a6}"
+            "@media (prefers-color-scheme: dark){text{fill:#dde}.other{fill:#6b7385}}</style>"
+        ),
     ]
     for index, (key, name, unit) in enumerate(
         [("seconds", "Time", "s"), ("peak_mib", "Peak memory", "MiB")]

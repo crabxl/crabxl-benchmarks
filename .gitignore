@@ -1,4 +1,2 @@
-/rust/driver/target/
-/rust/data/
-/python/data/
+/data/
 __pycache__/
