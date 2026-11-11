@@ -1,7 +1,7 @@
 # CrabXL benchmarks
 
 Speed and peak memory of [CrabXL for Python](https://pypi.org/project/crabxl/)
-compared with other Python XLSX libraries.
+compared with other Python XLSX libraries. See the [results](results/results.md).
 
 ## Run
 
@@ -13,13 +13,12 @@ uv run run.py
 
 uv installs CrabXL and every compared library from PyPI. The suite writes its
 input files to `data/` (ignored by Git) on the first run and reuses them after
-that. Writing the xl and xxl files takes a long time, but only once. Build the
-nyc311 file by hand (see below). Results go to `results/`. Run the suite on an
+that. Build the nyc311 file by hand (see below). Results go to `results/`. Run the suite on an
 idle computer that is connected to power.
 
 ```sh
 uv run run.py --sizes small --runs 1 --libraries crabxl openpyxl
-uv run run.py --sizes small medium large
+uv run run.py --sizes nyc311
 uv run run.py --report-only
 ```
 
@@ -34,9 +33,8 @@ uv run run.py --report-only
 crabxl, wolfxl and openpyxl run in their normal mode and in their `read_only`
 or `write_only` mode. XlsxWriter runs in normal and `constant_memory` mode.
 python-calamine and fastexcel only read, and XlsxWriter only writes. openpyxl
-is slow, so it runs on the small size only. The xl, xxl and nyc311 files are
-read only, by the readers that can hold them in memory. At xxl, only streaming
-readers run: building Python objects for the whole sheet needs more than 28 GB.
+is slow, so it runs on the small size only. The nyc311 file is read only, by
+crabxl, wolfxl, python-calamine and fastexcel.
 
 ## Data
 
@@ -48,14 +46,7 @@ different values), a unique text, a date, a boolean and four decimal numbers.
 |---|---:|---:|---:|
 | small | 10,000 × 10 | 100,000 | 0.6 MB |
 | medium | 100,000 × 10 | 1,000,000 | 6 MB |
-| large | 1,000,000 × 10 | 10,000,000 | 60 MB |
-| xl | 1,000,000 × 100 | 100,000,000 | about 340 MB |
-| xxl | 1,000,000 × 280 | 280,000,000 | about 950 MB |
 | nyc311 | 1,000,001 × 41 | 28,056,975 non-empty | 220 MB |
-
-Sheets wider than 10 columns repeat the same 10-column pattern. XlsxWriter can
-only write files that large in constant-memory mode, which stores text inline
-instead of in a shared string table.
 
 ### NYC 311 file
 
@@ -87,7 +78,7 @@ differently. All readers read the first worksheet.
   10 seconds is measured by that run only.
 - Every case runs single-threaded: the process starts suspended and is pinned
   to the same single logical CPU for every library before it runs any code.
-- wolfxl's safety limits, which reject the large file, are raised.
+- wolfxl's safety limits, which reject large files, are raised.
 - Every case prints the number of cells it handled. Check `cells` in
   `results.json` to confirm that all libraries did the same work.
 - A case that takes more than 2 minutes is shown as a timeout. A case that

@@ -37,30 +37,22 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 RESULTS = ROOT / "results"
-# Size name: (rows, columns). The xl, xxl and nyc311 files are read only.
+# Size name: (rows, columns). nyc311 is read only.
 SIZES = {
     "small": (10_000, 10),
     "medium": (100_000, 10),
-    "large": (1_000_000, 10),
-    "xl": (1_000_000, 100),
-    "xxl": (1_000_000, 280),
     # The NYC 311 sample that the calamine README uses. See the README.
     "nyc311": (1_000_001, 41),
 }
 NYC311_CELLS = 28_056_975  # Non-empty fields of the CSV.
-# Readers of the read-only sizes. At xxl, readers that build Python objects for
-# the whole sheet would need more than 28 GB, so only streaming readers run.
-STREAMING_READERS = [
+NYC311_READERS = [
     "crabxl (read_only)",
     "wolfxl (read_only)",
     "python-calamine (iter_rows)",
     "fastexcel",
+    "crabxl",
+    "python-calamine",
 ]
-HUGE_READERS = {
-    "xl": STREAMING_READERS + ["crabxl", "python-calamine"],
-    "xxl": STREAMING_READERS,
-    "nyc311": STREAMING_READERS + ["crabxl", "python-calamine"],
-}
 PINNED_CPU = 2  # Not CPU 0, which handles most interrupts.
 COLUMNS = 10
 SHEET = "Data"
@@ -120,9 +112,9 @@ def value(row, column):
     return value(row, column % 10)  # Wider sheets repeat the 10-column pattern.
 
 
-def rows(start, stop, columns=COLUMNS):
+def rows(start, stop):
     for row in range(start, stop):
-        yield [value(row, column) for column in range(columns)]
+        yield [value(row, column) for column in range(COLUMNS)]
 
 
 # ---------------------------------------------------------------- cases
@@ -251,19 +243,12 @@ def edit(library, source, path, count):
     return changed
 
 
-def fixture(count, columns, path):
-    """Write an input file with XlsxWriter.
-
-    Files wider than 10 columns use constant-memory mode, the only mode in which
-    XlsxWriter can write them. That mode stores text inline instead of in a
-    shared string table. Writing xxl takes a long time, but only once.
-    """
+def fixture(count, path):
     import xlsxwriter
 
-    options = {"default_date_format": "yyyy-mm-dd", "constant_memory": columns > 10}
-    with xlsxwriter.Workbook(str(path), options) as book:
+    with xlsxwriter.Workbook(str(path), {"default_date_format": "yyyy-mm-dd"}) as book:
         sheet = book.add_worksheet(SHEET)
-        for index, row in enumerate(rows(0, count, columns)):
+        for index, row in enumerate(rows(0, count)):
             sheet.write_row(index, 0, row)
 
 
@@ -397,6 +382,18 @@ def run(command, env=None):
     return seconds, peak_memory(process), used, out.decode().strip()
 
 
+def machine():
+    """The operating system and CPU name."""
+    name = platform.processor() or platform.machine()
+    if os.name == "nt":
+        import winreg
+
+        key = r"HARDWARE\DESCRIPTION\System\CentralProcessor\0"
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key) as handle:
+            name = winreg.QueryValueEx(handle, "ProcessorNameString")[0].strip()
+    return f"{platform.system()} {platform.release()}, {name}"
+
+
 def versions():
     from importlib.metadata import version
 
@@ -432,6 +429,15 @@ def main():
 
     python, env = interpreter()
     previous = {}
+    # A case that was too slow at the next smaller size in an earlier run is
+    # skipped too, so that sizes can be run one at a time.
+    saved = RESULTS / "results.json"
+    if saved.exists():
+        order = list(SIZES)
+        smaller = order.index(min(args.sizes, key=order.index)) - 1
+        for record in json.loads(saved.read_text())["results"]:
+            if smaller >= 0 and record["size"] == order[smaller]:
+                previous[(record["scenario"], record["library"])] = record
     work = ROOT / "data"
     work.mkdir(exist_ok=True)
     results = []
@@ -441,9 +447,8 @@ def main():
         if size == "nyc311" and not source.exists():
             raise SystemExit(f"{source} is missing. See the README to build it.")
         if not source.exists():
-            print(f"Writing {source.name}", flush=True)
-            fixture(count, columns, source)
-        scenarios = {"read": HUGE_READERS[size]} if size in HUGE_READERS else SCENARIOS
+            fixture(count, source)
+        scenarios = {"read": NYC311_READERS} if size == "nyc311" else SCENARIOS
         for scenario, libraries in scenarios.items():
             for library in libraries:
                 if size != "small" and library.startswith(SMALL_ONLY):
@@ -513,7 +518,7 @@ def main():
                 output.unlink(missing_ok=True)
 
     report = {
-        "machine": f"{platform.system()} {platform.release()}, {platform.processor() or platform.machine()}",
+        "machine": machine(),
         "cpus": os.cpu_count(),
         "python": platform.python_version(),
         "versions": versions(),
