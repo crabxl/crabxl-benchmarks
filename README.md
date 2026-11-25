@@ -17,24 +17,33 @@ that. Build the nyc311 file by hand (see below). Results go to `results/`. Run t
 idle computer that is connected to power.
 
 ```sh
-uv run run.py --sizes small --runs 1 --libraries crabxl openpyxl
+uv run run.py --sizes small --runs 1 --libraries "crabxl (Reader)" openpyxl
 uv run run.py --sizes nyc311
 uv run run.py --report-only
+```
+
+To test a CrabXL wheel that is not on PyPI, put it in a directory and pass
+that directory to uv:
+
+```sh
+uv run --find-links path/to/wheels run.py
 ```
 
 ## Scenarios
 
 | Scenario | Task | Libraries |
 |---|---|---|
-| Read | Open the file and visit every cell value. | crabxl, wolfxl, oxlsx, python-calamine (`iter_rows` and `to_python`), fastexcel, openpyxl |
-| Write | Create the sheet with `append` (or `write_row`) and save it. | crabxl, wolfxl, oxlsx, XlsxWriter, openpyxl |
-| Edit | Load the file, change one cell in every 100 rows, append 100 rows and save. | crabxl, wolfxl (`modify=True`), oxlsx, openpyxl |
+| Read | Open the file and visit every cell value. | crabxl (`Reader` and `Workbook`), crabxl.openpyxl, wolfxl, oxlsx, python-calamine (`iter_rows` and `to_python`), fastexcel, openpyxl |
+| Write | Create the sheet with `append` (or `write_row`) and save it. | crabxl (`Writer` and `Workbook`), crabxl.openpyxl, wolfxl, oxlsx, XlsxWriter, openpyxl |
+| Edit | Load the file, change one cell in every 100 rows, append 100 rows and save. | crabxl (`Workbook`), crabxl.openpyxl, wolfxl (`modify=True`), oxlsx, openpyxl |
 
-crabxl, wolfxl and openpyxl run in their normal mode and in their `read_only`
-or `write_only` mode. XlsxWriter runs in normal and `constant_memory` mode.
+`crabxl` is the native CrabXL API. `Reader` and `Writer` stream, and
+`Workbook` loads the whole file. `crabxl.openpyxl` is the openpyxl-compatible
+API of the same package. crabxl.openpyxl, wolfxl and openpyxl run in their
+normal mode and in their `read_only` or `write_only` mode. XlsxWriter runs in normal and `constant_memory` mode.
 python-calamine and fastexcel only read, and XlsxWriter only writes. openpyxl
 is slow, so it runs on the small size only. The nyc311 file is read only, by
-crabxl, wolfxl, python-calamine and fastexcel.
+crabxl, crabxl.openpyxl, wolfxl, python-calamine and fastexcel.
 
 ## Data
 

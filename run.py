@@ -1,7 +1,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "crabxl",
+#     "crabxl>=0.3.0",
 #     "wolfxl",
 #     "oxlsx",
 #     "python-calamine",
@@ -46,11 +46,13 @@ SIZES = {
 }
 NYC311_CELLS = 28_056_975  # Non-empty fields of the CSV.
 NYC311_READERS = [
-    "crabxl (read_only)",
+    "crabxl (Reader)",
+    "crabxl.openpyxl (read_only)",
     "wolfxl (read_only)",
     "python-calamine (iter_rows)",
     "fastexcel",
-    "crabxl",
+    "crabxl (Workbook)",
+    "crabxl.openpyxl",
     "python-calamine",
 ]
 PINNED_CPU = 2  # Not CPU 0, which handles most interrupts.
@@ -64,8 +66,10 @@ SMALL_ONLY = ("openpyxl",)
 
 SCENARIOS = {
     "read": [
-        "crabxl (read_only)",
-        "crabxl",
+        "crabxl (Reader)",
+        "crabxl (Workbook)",
+        "crabxl.openpyxl (read_only)",
+        "crabxl.openpyxl",
         "wolfxl (read_only)",
         "wolfxl",
         "oxlsx",
@@ -76,8 +80,10 @@ SCENARIOS = {
         "openpyxl",
     ],
     "write": [
-        "crabxl (write_only)",
-        "crabxl",
+        "crabxl (Writer)",
+        "crabxl (Workbook)",
+        "crabxl.openpyxl (write_only)",
+        "crabxl.openpyxl",
         "wolfxl (write_only)",
         "wolfxl",
         "oxlsx",
@@ -86,7 +92,7 @@ SCENARIOS = {
         "openpyxl (write_only)",
         "openpyxl",
     ],
-    "edit": ["crabxl", "wolfxl (modify)", "oxlsx", "openpyxl"],
+    "edit": ["crabxl (Workbook)", "crabxl.openpyxl", "wolfxl (modify)", "oxlsx", "openpyxl"],
 }
 
 
@@ -129,6 +135,13 @@ def read_values(rows_iter):
     return cells
 
 
+def openpyxl_style(library):
+    """The module of a library with the openpyxl API."""
+    import importlib
+
+    return importlib.import_module(library.split()[0])
+
+
 def no_limits(module):
     """Safety limits that would reject the large files are not part of a speed test."""
     if module.__name__ == "wolfxl":
@@ -151,8 +164,19 @@ def read(library, path):
         # wolfxl's native ZIP guard reads these before the package is opened.
         for name in ("ENTRY_BYTES", "TOTAL_BYTES", "ENTRIES", "COMPRESSION_RATIO"):
             os.environ[f"WOLFXL_MAX_ZIP_{name}"] = str(1 << 40)
-    if library.startswith(("crabxl", "wolfxl", "openpyxl")):
-        module = __import__(library.split()[0])
+    if library == "crabxl (Reader)":
+        import crabxl
+
+        with crabxl.Reader.open(path, limits="unlimited") as reader:
+            return read_values(reader.worksheets[0].iter_rows())
+    if library == "crabxl (Workbook)":
+        import crabxl
+
+        with crabxl.Workbook.open(path, limits="unlimited") as book:
+            used = book.worksheets[0].used_range
+            return read_values(used.iter_rows()) if used else 0
+    if library.startswith(("crabxl.openpyxl", "wolfxl", "openpyxl")):
+        module = openpyxl_style(library)
         book = module.load_workbook(
             path, read_only="read_only" in library, **no_limits(module)
         )
@@ -183,8 +207,19 @@ def read(library, path):
 
 
 def write(library, count, path):
-    if library.startswith(("crabxl", "wolfxl", "openpyxl")):
-        module = __import__(library.split()[0])
+    if library == "crabxl (Writer)":
+        import crabxl
+
+        with crabxl.Writer.create(path) as writer:
+            writer.worksheets.add(SHEET).extend(rows(0, count))
+    elif library == "crabxl (Workbook)":
+        import crabxl
+
+        with crabxl.Workbook() as book:
+            book.worksheets.add(SHEET).extend(rows(0, count))
+            book.save(path)
+    elif library.startswith(("crabxl.openpyxl", "wolfxl", "openpyxl")):
+        module = openpyxl_style(library)
         book = module.Workbook(write_only="write_only" in library)
         if "write_only" in library:
             sheet = book.create_sheet(SHEET)
@@ -221,8 +256,20 @@ def write(library, count, path):
 def edit(library, source, path, count):
     """Change column B in one row of every 100, append 100 rows and save."""
     name = library.split()[0]
-    if name in ("crabxl", "openpyxl", "wolfxl"):
-        module = __import__(name)
+    if library == "crabxl (Workbook)":
+        import crabxl
+
+        with crabxl.Workbook.open(source, limits="unlimited") as book:
+            sheet = book.worksheets[SHEET]
+            changed = 0
+            for row in range(1, count + 1, EDIT_STEP):
+                sheet[f"B{row}"].value = "changed"
+                changed += 1
+            sheet.extend(rows(count, count + EDIT_APPEND))
+            book.save(path)
+        return changed + EDIT_APPEND * COLUMNS
+    if name in ("crabxl.openpyxl", "openpyxl", "wolfxl"):
+        module = openpyxl_style(library)
         options = {"modify": True} if name == "wolfxl" else {}
         book = module.load_workbook(source, **options, **no_limits(module))
     elif name == "oxlsx":
